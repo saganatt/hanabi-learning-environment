@@ -1,1 +1,13 @@
 *.pyc
+
+*.csv
+*.png
+*.txt
+
+*.egg-info
+*.so
+_skbuild/
+
+cmake_install.cmake
+CMakeFiles
+Makefile

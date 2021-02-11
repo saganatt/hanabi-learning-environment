@@ -1,0 +1,1016 @@
+diff --git a/.gitignore b/.gitignore
+index 7e99e36..1a3df55 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,13 @@
+-*.pyc
+\ No newline at end of file
++*.pyc
++
++*.csv
++*.png
++*.txt
++
++*.egg-info
++*.so
++_skbuild/
++
++cmake_install.cmake
++CMakeFiles
++Makefile
+diff --git a/diff_with_master.patch b/diff_with_master.patch
+new file mode 100644
+index 0000000..e69de29
+diff --git a/examples/plotter.py b/examples/plotter.py
+new file mode 100644
+index 0000000..d317240
+--- /dev/null
++++ b/examples/plotter.py
+@@ -0,0 +1,75 @@
++# pylint: disable=missing-function-docstring, invalid-name, too-many-arguments
++"""Plotting utilities."""
++
++from statistics import mean, median, stdev
++import numpy as np
++import matplotlib
++import matplotlib.pyplot as plt
++
++# We show histogram for max reward per game rules (number of fireworks cards)
++MAX_REWARD=12
++
++def bins_labels(bins, sparsity, **kwargs):
++  n = len(bins)
++  max_b = max(bins)
++  min_b = min(bins)
++  bin_w = (max_b - min_b) / (n - 1)
++  bin_ticks = np.arange(min_b+bin_w/2, max_b + bin_w, sparsity*bin_w)
++  sparse_bins = np.take(bins, range(0, max(bins), sparsity))
++  plt.xticks(bin_ticks, sparse_bins, **kwargs)
++  plt.close()
++
++def plot_hist(rewards, agent_id, suffix, player_number, save_csv=True):
++  fig, ax = plt.subplots(1, 1)
++  bins = range(MAX_REWARD + 1)
++  ax.hist(rewards, bins=bins, density=True)
++  bins_labels(bins, sparsity=5)
++  ax.set_xlabel('Points')
++  ax.set_ylabel('Proportion of games')
++
++  mean_reward = mean(rewards)
++  median_reward = median(rewards)
++  stdev_reward = stdev(rewards)
++  n = len(rewards)
++
++  form_str = '{} players\nMean score = {:.2f}\nMedian score = {:.0f}\ns.d. = {:.2f}\nn = {}'
++  ax.text(0.98, 0.98, form_str.format(player_number, mean_reward, median_reward, stdev_reward, n),
++          ha='right', va='top', transform=plt.gca().transAxes)
++
++  fig.tight_layout()
++  filename = 'hist_rewards-player_{}-{}'.format(agent_id, suffix)
++  fig.savefig('{}.png'.format(filename), bbox_inches='tight')
++  if save_csv:
++    np.savetxt('{}.csv'.format(filename), np.array(rewards), delimiter=',')
++  plt.close()
++
++def plot_learning_rewards(rewards, agent_id, suffix, save_csv=True):
++  fig, ax = plt.subplots(1, 1)
++  ax.plot(range(len(rewards)), rewards, '.')
++  ax.set_xlabel('Episodes')
++  ax.set_ylabel('Sum of rewards during episode')
++  ax.get_yaxis().set_major_formatter(
++      matplotlib.ticker.FuncFormatter(lambda x, p: format(int(x), ',')))
++  fig.tight_layout()
++  filename = 'learning_rewards-player_{}-{}'.format(agent_id, suffix)
++  fig.savefig('{}.png'.format(filename), bbox_inches='tight')
++  if save_csv:
++    np.savetxt('{}.csv'.format(filename), np.array(rewards, dtype=int), delimiter=',', fmt='%i')
++  fig.clear()
++  plt.close(fig)
++
++def plot_actions(actions, agent_id, suffix, save_csv=True):
++  fig, ax = plt.subplots(1, 1)
++  keys = list(actions.keys())
++  vals = list(actions.values())
++  ax.bar(keys, vals)
++  ax.set_xlabel('Actions')
++  ax.set_ylabel('Count')
++
++  fig.tight_layout()
++  filename = 'actions-player_{}-{}'.format(agent_id, suffix)
++  fig.savefig('{}.png'.format(filename), bbox_inches='tight')
++  header = ','.join(k for k in keys)
++  if save_csv:
++    np.savetxt('{}.csv'.format(filename), vals, header=header, delimiter=',')
++  plt.close()
+diff --git a/examples/rl_env_example.py b/examples/rl_env_example.py
+index 7d03813..38929b5 100644
+--- a/examples/rl_env_example.py
++++ b/examples/rl_env_example.py
+@@ -16,66 +16,158 @@
+ from __future__ import print_function
+ 
+ import sys
++import random
+ import getopt
++import resource
++import psutil
+ from hanabi_learning_environment import rl_env
+ from hanabi_learning_environment.agents.random_agent import RandomAgent
+ from hanabi_learning_environment.agents.simple_agent import SimpleAgent
++from hanabi_learning_environment.agents.greedy_agent import GreedyAgent
++from hanabi_learning_environment.agents.q_agent import QAgent
++from hanabi_learning_environment.agents.q_util import get_next_state
++from plotter import plot_hist, plot_learning_rewards, plot_actions
+ 
+-AGENT_CLASSES = {'SimpleAgent': SimpleAgent, 'RandomAgent': RandomAgent}
++AGENT_CLASSES = {'SimpleAgent': SimpleAgent, 'RandomAgent': RandomAgent, 'QAgent': QAgent}
+ 
++def get_memory_usage(obj):
++  size = sys.getsizeof(obj)
++  if 1024 <= size < 1024**2:
++    return size // 1024, 'k'
++  if 1024**2 <= size < 1024**3:
++    return size // (1024**2), 'M'
++  if 1024**3 <= size:
++      return size // (1024**3), 'G'
++  return size, ''
+ 
+-class Runner(object):
++def print_memory_usage(agents, runner):
++  for agent_id, agent in enumerate(agents):
++    size, multiplier = get_memory_usage(agent)
++    print('Size of agent {} state dict in {}B: {}'.format(agent_id, multiplier, size))
++  size, multiplier = get_memory_usage(runner)
++  print('Size of runner: {} {}B'.format(size, multiplier))
++  print('Free RAM: {}'.format(psutil.virtual_memory().available))
++  print('RAM used by application: {}'.format(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
++
++class Runner():
+   """Runner class."""
+ 
+   def __init__(self, flags):
+     """Initialize runner."""
+     self.flags = flags
+-    self.agent_config = {'players': flags['players']}
+-    self.environment = rl_env.make('Hanabi-Full', num_players=flags['players'])
++    self.agent_config = {'players': flags['players'], 'alpha': flags['alpha'],
++                         'gamma': flags['gamma']}
++    self.environment = rl_env.make('Hanabi-My-Small', num_players=flags['players'],
++                                   seed=flags['seed'])
+     self.agent_class = AGENT_CLASSES[flags['agent_class']]
+ 
+-  def run(self):
++  def play_episode(self, agents, actions):
++    observations = self.environment.reset()
++    done = False
++    episode_reward = 0
++    agents_rewards = {i: 0 for i, _ in enumerate(agents)}
++    while not done:
++      for agent_id, agent in enumerate(agents):
++        observation = observations['player_observations'][agent_id]
++        def get_next_state_wrapper(action):
++          return get_next_state(self.environment.state.copy(), agent_id, action,
++                                self.environment.game)
++        action, reward = agent.act(observation, get_next_state_wrapper)
++        if observation['current_player'] == agent_id:
++          assert action is not None
++          current_player_action = action
++          actions[agent_id][action['action_type']] += 1
++          agents_rewards[agent_id] += reward
++        else:
++          assert action is None
++      # Make an environment step.
++      # Done only once, when current action != None
++      observations, _, done, _ = self.environment.step(current_player_action)
++    episode_reward = self.environment.state.score() #reward
++    print('Episode reward: {}'.format(episode_reward))
++    return episode_reward, agents_rewards, actions
++
++  def run(self, num_episodes, agents=None):
+     """Run episodes."""
+     rewards = []
+-    for episode in range(flags['num_episodes']):
+-      observations = self.environment.reset()
++    if agents is None:
+       agents = [self.agent_class(self.agent_config)
+                 for _ in range(self.flags['players'])]
+-      done = False
+-      episode_reward = 0
+-      while not done:
+-        for agent_id, agent in enumerate(agents):
+-          observation = observations['player_observations'][agent_id]
+-          action = agent.act(observation)
+-          if observation['current_player'] == agent_id:
+-            assert action is not None
+-            current_player_action = action
+-          else:
+-            assert action is None
+-        # Make an environment step.
+-        print('Agent: {} action: {}'.format(observation['current_player'],
+-                                            current_player_action))
+-        observations, reward, done, unused_info = self.environment.step(
+-            current_player_action)
+-        episode_reward += reward
++    agents_rewards = {i: [] for i, _ in enumerate(agents)}
++    actions = {i: {'DISCARD': 0, 'PLAY': 0, 'REVEAL_COLOR': 0, 'REVEAL_RANK': 0}
++               for i, _ in enumerate(agents)}
++    for episode in range(num_episodes):
++      print('=' * 100)
++      print('Episode: {}'.format(episode))
++      episode_reward, agent_ep_rewards, actions = self.play_episode(agents, actions)
+       rewards.append(episode_reward)
+-      print('Running episode: %d' % episode)
+-      print('Max Reward: %.3f' % max(rewards))
+-    return rewards
++      for agent_id, _ in enumerate(agents):
++        agents_rewards[agent_id].append(agent_ep_rewards[agent_id])
++      print('Max reward: %.3f' % max(rewards))
++      print_memory_usage(agents, self)
++      print('=' * 100)
++    print('Final max reward: %.3f' % max(rewards))
++    return agents, rewards, agents_rewards, actions
+ 
+-if __name__ == "__main__":
+-  flags = {'players': 2, 'num_episodes': 1, 'agent_class': 'SimpleAgent'}
++def main():
++  flags = {'players': 2, 'num_episodes': 1, 'num_test_episodes': 1, 'agent_class': 'SimpleAgent',
++           'alpha': 0.1, 'gamma': 0.9, 'seed': 12345}
+   options, arguments = getopt.getopt(sys.argv[1:], '',
+                                      ['players=',
+                                       'num_episodes=',
+-                                      'agent_class='])
++                                      'num_test_episodes=',
++                                      'agent_class=',
++                                      'seed=',
++                                      'alpha=',
++                                      'gamma='])
+   if arguments:
+     sys.exit('usage: rl_env_example.py [options]\n'
+              '--players       number of players in the game.\n'
+              '--num_episodes  number of game episodes to run.\n'
++             '--num_test_episodes  number of test game episodes to run.\n'
++             '--alpha         step size for Q-learning. \n'
++             '--gamma         discount rate for Q-learning. \n'
++             '--seed          random generator seed. \n'
+              '--agent_class   {}'.format(' or '.join(AGENT_CLASSES.keys())))
+   for flag, value in options:
+     flag = flag[2:]  # Strip leading --.
+     flags[flag] = type(flags[flag])(value)
++
++  random.seed(flags['seed'])
++
++  form_str = 'players_{}-episodes_{}-test_episodes_{}-agent_{}-alpha_{}-gamma_{}-seed_{}'
++  suffix = form_str.format(flags['players'], flags['num_episodes'], flags['num_test_episodes'],
++                           flags['agent_class'], flags['alpha'], flags['gamma'], flags['seed'])
++  train_suffix = suffix + '-train'
++  test_suffix = suffix + '-test'
++
+   runner = Runner(flags)
+-  runner.run()
++
++  print('*' * 100)
++  print('TRAINING')
++  agents, rewards, agents_rewards, actions = runner.run(flags['num_episodes'])
++  print('*' * 100)
++
++  player_num = len(agents)
++
++  for ar in agents_rewards:
++    plot_learning_rewards(agents_rewards[ar], ar, train_suffix)
++    plot_actions(actions[ar], ar, train_suffix)
++  plot_hist(rewards, -1, train_suffix, flags['players'])
++
++  if flags['agent_class'] == 'QAgent':
++    greedy_agents = [GreedyAgent(runner.agent_config, agent.Q) for agent in agents]
++    print('*' * 100)
++    print('TESTING')
++    _, rewards, agents_rewards, actions = runner.run(flags['num_test_episodes'], greedy_agents)
++    print('*' * 100)
++    plot_hist(rewards, -1, test_suffix, flags['players'])
++    for ar in agents_rewards:
++      plot_actions(actions[ar], ar, test_suffix)
++
++  print('rewards:\n{}'.format(rewards))
++  print('agent 0 rewards:\n{}'.format(agents_rewards[0]))
++  print('agent 1 rewards:\n{}'.format(agents_rewards[1]))
++
++if __name__ == "__main__":
++  main()
+diff --git a/get_wins_stats.py b/get_wins_stats.py
+new file mode 100644
+index 0000000..d7e2cbd
+--- /dev/null
++++ b/get_wins_stats.py
+@@ -0,0 +1,49 @@
++"""Standalone script to retrieve more wins statistics"""
++import numpy as np
++
++SEEDS=[283723, 12345, 39845, 23458, 98437]
++DIR='new-alpha-0.1_gamma-0.9_life-3_info-8_colors-4_ranks-3_hand-4/'
++SIMPLE_STR='hist_rewards-player_-1-players_2-episodes_1000-test_episodes_1000-' + \
++           'agent_SimpleAgent-alpha_0.1-gamma_0.9-seed_{}-train.csv'
++Q_STR='hist_rewards-player_-1-players_2-episodes_100000-test_episodes_1000-' + \
++      'agent_QAgent-alpha_0.1-gamma_0.9-seed_{}-{}.csv'
++
++stat_dict = {'simple': 0., 'q train': 0., 'q test': 0.}
++stats = {'all means': stat_dict.copy(), 'all std dev': stat_dict.copy(),
++         'wins means': stat_dict.copy(), 'wins means std dev': stat_dict.copy(),
++         'wins count': stat_dict.copy(), 'wins percs': stat_dict.copy()}
++for seed in SEEDS:
++  files = {'simple': DIR + SIMPLE_STR.format(seed),
++           'q train': DIR + Q_STR.format(seed, 'train'),
++           'q test': DIR + Q_STR.format(seed, 'test')}
++  print('seed: {}'.format(seed))
++  for fkey in files:
++    res = np.genfromtxt(files[fkey], delimiter=',')
++    wins = res[res > 0.]
++
++    num_all = res.shape[0]
++    mean_all = np.mean(res)
++    std_dev_all = np.std(res)
++
++    num_wins = wins.shape[0]
++    mean_win = np.mean(wins)
++    std_dev_win = np.std(wins)
++    perc_wins = 100. * num_wins / num_all
++
++    print('{} num all: {} wins: {} perc: {:.3f}'.format(fkey, num_all, num_wins, perc_wins))
++    print('mean all: {:.3f} ({:.3f}) mean win: {:.3f} ({:.3f})'
++          .format(mean_all, std_dev_all, mean_win, std_dev_win))
++
++    stats['all means'][fkey] += mean_all
++    stats['all std dev'][fkey] += std_dev_all
++    stats['wins means'][fkey] += mean_win
++    stats['wins means std dev'][fkey] += std_dev_win
++    stats['wins count'][fkey] += num_wins
++    stats['wins percs'][fkey] += perc_wins
++
++print()
++NUM_SEEDS = len(SEEDS)
++for stat in stats:
++  for fkey in stat_dict:
++    stats[stat][fkey] /= NUM_SEEDS
++    print('mean {} {}: {:.3f}'.format(stat, fkey, stats[stat][fkey]))
+diff --git a/hanabi_learning_environment/agents/greedy_agent.py b/hanabi_learning_environment/agents/greedy_agent.py
+new file mode 100644
+index 0000000..463b671
+--- /dev/null
++++ b/hanabi_learning_environment/agents/greedy_agent.py
+@@ -0,0 +1,54 @@
++"""Greedy Agent."""
++import random
++import operator
++
++from hanabi_learning_environment.rl_env import Agent
++from hanabi_learning_environment.agents.qstate import QState
++from hanabi_learning_environment.agents.q_util import action_to_hash, hash_to_action
++
++
++class GreedyAgent(Agent):
++  """Greedy agent for given policy."""
++
++  def __init__(self, config, Q, *args, **kwargs):
++    """Initialize the agent."""
++    self.config = config
++    self.Q = Q
++
++  def act(self, observation, get_next_state):
++    """Act based on an observation. get_next_state() is used only for simulation."""
++    # Checks if this game observer is the current player to make a move
++    if observation['current_player_offset'] != 0:
++      return None, -1
++
++    S = QState(observation)
++    choose_randomly = False
++    actions = {action_to_hash(a): 0 for a in observation['legal_moves']}
++
++    # State not visited previously, initialise for all possible actions.
++    if S not in self.Q:
++      print('Greedy agent encountering a new state')
++      choose_randomly = True
++      self.Q[S] = actions
++    else:
++      # In case of simple state settings (less accurate hashing), QAgent might be in
++      # a bit different state and add some actions forbidden in the actual current
++      # GreedyAgent state. So we pick only actions that are contained in the legal moves.
++      new_actions = {a: self.Q[S][a] for a in self.Q[S].keys() & actions}
++      if new_actions: # If not empty, choose from valid subset of Q[S]
++        actions = new_actions
++      else:
++        choose_randomly = True # Force random choice as there is no valid action available in Q
++
++    # Choose A from S using policy derived from Q
++    # In case of less accurate hashing, choice is restricted to subset of valid actions
++    if choose_randomly: # Random choice
++      A_hash = random.choice(list(actions.keys()))
++    else: # Greedy choice
++      # Key corresponding to action with max value in Q[S] dict.
++      A_hash = max(actions.items(), key=operator.itemgetter(1))[0]
++    A = hash_to_action(A_hash)
++
++    _, R = get_next_state(A)
++
++    return A, R
+diff --git a/hanabi_learning_environment/agents/q_agent.py b/hanabi_learning_environment/agents/q_agent.py
+new file mode 100644
+index 0000000..2f6b4a3
+--- /dev/null
++++ b/hanabi_learning_environment/agents/q_agent.py
+@@ -0,0 +1,56 @@
++"""Q-learning Agent.
++WARNING: Values hardcoded for game with max 5 colors, ranks max 5."""
++import random
++import operator
++
++from hanabi_learning_environment.rl_env import Agent
++from hanabi_learning_environment.agents.qstate import QState
++from hanabi_learning_environment.agents.q_util import action_to_hash, hash_to_action
++
++EPS = 0.1
++
++class QAgent(Agent):
++  """Agent that applies Q-learning."""
++
++  def __init__(self, config, *args, **kwargs):
++    """Initialize the agent."""
++    self.config = config
++    # Extract max info tokens or set default to 8.
++    self.max_information_tokens = config.get('information_tokens', 8)
++    self.alpha = config.get('alpha', 0.1)
++    self.gamma = config.get('gamma', 0.9)
++    self.Q = {} # Values for new state-action pairs added lazily
++    self.R = 0
++
++  @staticmethod
++  def playable_card(card, fireworks):
++    """A card is playable if it can be placed on the fireworks pile."""
++    return card['rank'] == fireworks[card['color']]
++
++  def act(self, observation, get_next_state):
++    """Act based on an observation. get_next_state() is used only for simulation."""
++    # Checks if this game observer is the current player to make a move
++    if observation['current_player_offset'] != 0:
++      return None, -1
++    S = QState(observation)
++    # State not visited previously, initialise for all possible actions.
++    if S not in self.Q:
++      self.Q[S] = {action_to_hash(a): 0 for a in observation['legal_moves']}
++
++    # Choose A from S using policy derived from Q -- here eps-greedy
++    if random.random() <= EPS: # Random choice
++      A_hash = random.choice(list(self.Q[S].keys()))
++      print('random choice')
++    else: # Greedy choice
++      # Key corresponding to action with max value in Q[S] dict.
++      A_hash = max(self.Q[S].items(), key=operator.itemgetter(1))[0]
++    A = hash_to_action(A_hash)
++
++    # Take (simulate) action A, observe R, S'
++    S_new, R = get_next_state(A)
++    max_Q_new = max(self.Q[S_new].values()) if S_new in self.Q else 0
++    # Q(S, A) = Q(S, A) + alpha[R + gamma max_a Q(S', a) -Q(S, A)]
++    self.Q[S][A_hash] += self.alpha * (R + self.gamma * max_Q_new - self.Q[S][A_hash])
++
++    # This is the actual action to be performed in the environment.
++    return A, R
+diff --git a/hanabi_learning_environment/agents/q_util.py b/hanabi_learning_environment/agents/q_util.py
+new file mode 100644
+index 0000000..8884428
+--- /dev/null
++++ b/hanabi_learning_environment/agents/q_util.py
+@@ -0,0 +1,100 @@
++"""Helper standalone functions for Q-learning agent."""
++
++from hanabi_learning_environment.agents.qstate import QState
++from hanabi_learning_environment.rl_env import HanabiEnv
++from hanabi_learning_environment.pyhanabi import HanabiMoveType
++
++# NOTE: Different colormap values than in qstate.py!
++COLORMAP = {'R': 0, 'Y': 1, 'G': 2, 'W': 3, 'B': 4}
++REV_COLORMAP = {0: 'R', 1: 'Y', 2: 'G', 3: 'W', 4: 'B'}
++NUM_COLORS = 5
++NUM_CARDS = 5 # Max number of cards held by a player
++NUM_PLAYERS = 5
++NUM_RANKS = 5
++FINAL_SCORE_MULTIPLIER = 1000
++CORRECT_PLAYED_CARD_REWARD = 5
++DISCARD_LAST_CARD_REWARD = -3
++DISCARD_PLAYED_CARD_REWARD = 5
++DISCARD_NOT_PLAYED_IN_GAME_CARD_REWARD = 3
++BASE_REVEL_REWARD = 3
++GAME_LOST_REWARD = -25000
++
++def get_next_state(state, player_id, action, hanabi_game):
++  """Simulate the action, get new state and reward"""
++  action = HanabiEnv.build_move_static(action)
++  prev_state = state.copy()
++  state.apply_move(action)
++  observation = HanabiEnv.extract_dict_static(player_id, state.observation(player_id), state)
++  reward = calculate_reward(prev_state, state, action, hanabi_game)
++  return QState(observation), reward
++
++def calculate_reward(prev_state, cur_state, action, hanabi_game):
++  """Get reward for taking the action from prev_state to cur_state"""
++  if cur_state.is_terminal():
++    # If current state is terminal return much bigger reward than in any other case.
++    # Reward based on final points.
++    if cur_state.score() == 0:
++      return GAME_LOST_REWARD
++    return cur_state.score() * FINAL_SCORE_MULTIPLIER
++
++  if action.type() == HanabiMoveType.PLAY:
++    # If discard pile size is same in both states, card was played properly.
++    if len(cur_state.discard_pile()) == len(prev_state.discard_pile()):
++      return CORRECT_PLAYED_CARD_REWARD
++    return -CORRECT_PLAYED_CARD_REWARD
++
++  if action.type() == HanabiMoveType.DISCARD:
++    cards_count = hanabi_game.num_cards(action.color(), action.rank())
++    cards_on_discard_pile = 0
++    for card in cur_state.discard_pile():
++      if card.color() == action.color() and card.rank() == action.rank():
++        cards_on_discard_pile += 1
++
++    # If all same type cards in game are on discard pile, one fireworks pile cannot be completed.
++    if cards_count == cards_on_discard_pile:
++      return DISCARD_LAST_CARD_REWARD
++
++    # If discarded card was already played on fireworks pile, discard move was perfect :)
++    if cur_state.fireworks()[action.color()] - 1 >= action.rank():
++      return DISCARD_PLAYED_CARD_REWARD
++
++    return DISCARD_NOT_PLAYED_IN_GAME_CARD_REWARD
++
++  if action.type() == HanabiMoveType.REVEAL_COLOR or action.type() == HanabiMoveType.REVEAL_RANK:
++    return BASE_REVEL_REWARD
++
++  raise Exception("Action type is illegal: " + str(action.type()))
++
++def action_to_hash(action):
++  """Action is a dict whose content is determined by the action type.
++  This is a copy of HanabiGame::GetMoveUid()."""
++  if action['action_type'] == 'DISCARD':
++    return action['card_index']
++  if action['action_type'] == 'PLAY':
++    return NUM_CARDS + action['card_index']
++  if action['action_type'] == 'REVEAL_COLOR':
++    return NUM_CARDS + NUM_CARDS + (action['target_offset'] - 1) * NUM_COLORS + \
++           COLORMAP[action['color']]
++  if action['action_type'] == 'REVEAL_RANK':
++    return NUM_CARDS + NUM_CARDS + (NUM_PLAYERS - 1) * NUM_COLORS + NUM_COLORS + \
++           (action['target_offset'] - 1) * NUM_RANKS + action['rank']
++  return -1
++
++def hash_to_action(a_hash):
++  """Deciphering the hash to a game action."""
++  if a_hash == -1:
++    raise ValueError('Invalid action hash')
++  if a_hash < NUM_CARDS:
++    return {'action_type': 'DISCARD', 'card_index': a_hash}
++  if a_hash < NUM_CARDS + NUM_CARDS:
++    return {'action_type': 'PLAY', 'card_index': a_hash - NUM_CARDS}
++  if a_hash < NUM_CARDS + NUM_CARDS + (NUM_PLAYERS - 1) * NUM_COLORS + NUM_COLORS:
++    target = (a_hash - NUM_CARDS - NUM_CARDS) // NUM_COLORS + 1
++    color = a_hash - NUM_CARDS - NUM_CARDS - (target - 1) * NUM_COLORS
++    return {'action_type': 'REVEAL_COLOR', 'target_offset': target,
++            'color': REV_COLORMAP[color]}
++  target = (a_hash - NUM_CARDS - NUM_CARDS - (NUM_PLAYERS - 1) * NUM_COLORS - NUM_COLORS) // \
++      NUM_RANKS + 1
++  rank = a_hash - NUM_CARDS - NUM_CARDS - (NUM_PLAYERS - 1) * NUM_COLORS - \
++      NUM_COLORS - (target - 1) * NUM_RANKS
++  return {'action_type': 'REVEAL_RANK', 'target_offset': target, 'rank': rank}
+diff --git a/hanabi_learning_environment/agents/qstate.py b/hanabi_learning_environment/agents/qstate.py
+new file mode 100644
+index 0000000..8efa3dd
+--- /dev/null
++++ b/hanabi_learning_environment/agents/qstate.py
+@@ -0,0 +1,53 @@
++"""Hashable game state for Q-learning."""
++
++COLORMAP = {None: 10, 'R': 20, 'Y': 30, 'G': 40, 'W': 50, 'B': 60}
++
++def card_to_int(card):
++  """Helper to hash a single card which is a dict of form: {'color': color, 'rank': value}"""
++  rank = card['rank'] + 2 # due to -1 if card rank is not known.
++  return COLORMAP[card['color']] + rank # card['rank']
++
++class QState():
++  """Represents state of the game from the Agent perspective i.e. observations.
++  A hashable class to make state keys for Q dict."""
++
++  def __init__(self, observation):
++    self.hands = observation['observed_hands']
++    self.discard_pile = observation['discard_pile']
++    self.fireworks = observation['fireworks']
++
++    # Hands are a list of lists of card dicts
++    self.h_hands = tuple([tuple(sorted([card_to_int(card) for card in hand]))
++                         for hand in observation['observed_hands']])
++
++    # Note: the order of card on the pile assumend to be not important.
++    # We lose the information which card was discarded most recently.
++    # Discard pile is a list of card dicts.
++    # We convert it to a hashable tuple of ints.
++    # The sorting makes hashing indifferent to the order of cards in the pile.
++    self.h_discard_pile = tuple(sorted([card_to_int(card) for card in observation['discard_pile']]))
++
++    # Encoding dict of {'color': count} to an int
++    self.h_fireworks = 0
++    for f_ind, f in enumerate(observation['fireworks'].values()): # dict
++      self.h_fireworks = self.h_fireworks + f * (f_ind + 1) * 10
++
++    self.info_tokens = observation['information_tokens'] # int
++    self.life_tokens = observation['life_tokens'] # int
++
++
++  def __hash__(self):
++    return hash((self.h_hands, self.h_discard_pile, self.h_fireworks,
++            self.info_tokens, self.life_tokens))
++
++  def __eq__(self, other):
++    self_tuple = (self.h_hands, self.h_discard_pile, self.h_fireworks,
++                    self.info_tokens, self.life_tokens)
++    other_tuple = (other.h_hands, other.h_discard_pile, other.h_fireworks,
++                    other.info_tokens, other.life_tokens)
++    return self_tuple == other_tuple
++
++  def __ne__(self, other):
++    # Not strictly necessary, but to avoid having both x==y and x!=y
++    # True at the same time
++    return not self == other
+diff --git a/hanabi_learning_environment/agents/random_agent.py b/hanabi_learning_environment/agents/random_agent.py
+index b4f5428..07e0344 100644
+--- a/hanabi_learning_environment/agents/random_agent.py
++++ b/hanabi_learning_environment/agents/random_agent.py
+@@ -24,9 +24,9 @@ class RandomAgent(Agent):
+     """Initialize the agent."""
+     self.config = config
+ 
+-  def act(self, observation):
++  def act(self, observation, get_next_state):
+     """Act based on an observation."""
+     if observation['current_player_offset'] == 0:
+-      return random.choice(observation['legal_moves'])
++      return random.choice(observation['legal_moves']), 0
+     else:
+-      return None
++      return None, -1
+diff --git a/hanabi_learning_environment/agents/simple_agent.py b/hanabi_learning_environment/agents/simple_agent.py
+index f024cdf..e12c856 100644
+--- a/hanabi_learning_environment/agents/simple_agent.py
++++ b/hanabi_learning_environment/agents/simple_agent.py
+@@ -30,16 +30,16 @@ class SimpleAgent(Agent):
+     """A card is playable if it can be placed on the fireworks pile."""
+     return card['rank'] == fireworks[card['color']]
+ 
+-  def act(self, observation):
++  def act(self, observation, get_next_state):
+     """Act based on an observation."""
+     if observation['current_player_offset'] != 0:
+-      return None
++      return None, -1.0
+ 
+     # Check if there are any pending hints and play the card corresponding to
+     # the hint.
+     for card_index, hint in enumerate(observation['card_knowledge'][0]):
+       if hint['color'] is not None or hint['rank'] is not None:
+-        return {'action_type': 'PLAY', 'card_index': card_index}
++        return {'action_type': 'PLAY', 'card_index': card_index}, 0
+ 
+     # Check if it's possible to hint a card to your colleagues.
+     fireworks = observation['fireworks']
+@@ -56,10 +56,10 @@ class SimpleAgent(Agent):
+                 'action_type': 'REVEAL_COLOR',
+                 'color': card['color'],
+                 'target_offset': player_offset
+-            }
++            }, 0
+ 
+     # If no card is hintable then discard or play.
+     if observation['information_tokens'] < self.max_information_tokens:
+-      return {'action_type': 'DISCARD', 'card_index': 0}
++      return {'action_type': 'DISCARD', 'card_index': 0}, 0
+     else:
+-      return {'action_type': 'PLAY', 'card_index': 0}
++      return {'action_type': 'PLAY', 'card_index': 0}, 0
+diff --git a/hanabi_learning_environment/rl_env.py b/hanabi_learning_environment/rl_env.py
+index faab071..8eb754e 100644
+--- a/hanabi_learning_environment/rl_env.py
++++ b/hanabi_learning_environment/rl_env.py
+@@ -379,18 +379,10 @@ class HanabiEnv(Environment):
+     obs["current_player"] = self.state.cur_player()
+     return obs
+ 
+-  def _extract_dict_from_backend(self, player_id, observation):
+-    """Extract a dict of features from an observation from the backend.
+-
+-    Args:
+-      player_id: Int, player from whose perspective we generate the observation.
+-      observation: A `pyhanabi.HanabiObservation` object.
+-
+-    Returns:
+-      obs_dict: dict, mapping from HanabiObservation to a dict.
+-    """
++  @staticmethod
++  def extract_dict_static(player_id, observation, state):
+     obs_dict = {}
+-    obs_dict["current_player"] = self.state.cur_player()
++    obs_dict["current_player"] = state.cur_player()
+     obs_dict["current_player_offset"] = observation.cur_player_offset()
+     obs_dict["life_tokens"] = observation.life_tokens()
+     obs_dict["information_tokens"] = observation.information_tokens()
+@@ -398,15 +390,13 @@ class HanabiEnv(Environment):
+     obs_dict["deck_size"] = observation.deck_size()
+ 
+     obs_dict["fireworks"] = {}
+-    fireworks = self.state.fireworks()
++    fireworks = state.fireworks()
+     for color, firework in zip(pyhanabi.COLOR_CHAR, fireworks):
+       obs_dict["fireworks"][color] = firework
+ 
+     obs_dict["legal_moves"] = []
+-    obs_dict["legal_moves_as_int"] = []
+     for move in observation.legal_moves():
+       obs_dict["legal_moves"].append(move.to_dict())
+-      obs_dict["legal_moves_as_int"].append(self.game.get_move_uid(move))
+ 
+     obs_dict["observed_hands"] = []
+     for player_hand in observation.observed_hands():
+@@ -431,37 +421,33 @@ class HanabiEnv(Environment):
+         player_hints_as_dicts.append(hint_d)
+       obs_dict["card_knowledge"].append(player_hints_as_dicts)
+ 
+-    # ipdb.set_trace()
+-    obs_dict["vectorized"] = self.observation_encoder.encode(observation)
+     obs_dict["pyhanabi"] = observation
+ 
+     return obs_dict
+ 
+-  def _build_move(self, action):
+-    """Build a move from an action dict.
++  def _extract_dict_from_backend(self, player_id, observation):
++    """Extract a dict of features from an observation from the backend.
+ 
+     Args:
+-      action: dict, mapping to a legal action taken by an agent. The following
+-        actions are supported:
+-          - { 'action_type': 'PLAY', 'card_index': int }
+-          - { 'action_type': 'DISCARD', 'card_index': int }
+-          - {
+-              'action_type': 'REVEAL_COLOR',
+-              'color': str,
+-              'target_offset': int >=0
+-            }
+-          - {
+-              'action_type': 'REVEAL_RANK',
+-              'rank': str,
+-              'target_offset': int >=0
+-            }
++      player_id: Int, player from whose perspective we generate the observation.
++      observation: A `pyhanabi.HanabiObservation` object.
+ 
+     Returns:
+-      move: A `HanabiMove` object constructed from action.
+-
+-    Raises:
+-      ValueError: Unknown action type.
++      obs_dict: dict, mapping from HanabiObservation to a dict.
+     """
++    obs_dict = self.extract_dict_static(player_id, observation, self.state)
++
++    obs_dict["legal_moves_as_int"] = []
++    for move in observation.legal_moves():
++      obs_dict["legal_moves_as_int"].append(self.game.get_move_uid(move))
++
++    # ipdb.set_trace()
++    obs_dict["vectorized"] = self.observation_encoder.encode(observation)
++
++    return obs_dict
++
++  @staticmethod
++  def build_move_static(action):
+     assert isinstance(action, dict), "Expected dict, got: {}".format(action)
+     assert "action_type" in action, ("Action should contain `action_type`. "
+                                      "action: {}").format(action)
+@@ -489,6 +475,34 @@ class HanabiEnv(Environment):
+     else:
+       raise ValueError("Unknown action_type: {}".format(action_type))
+ 
++    return move
++
++  def _build_move(self, action):
++    """Build a move from an action dict.
++
++    Args:
++      action: dict, mapping to a legal action taken by an agent. The following
++        actions are supported:
++          - { 'action_type': 'PLAY', 'card_index': int }
++          - { 'action_type': 'DISCARD', 'card_index': int }
++          - {
++              'action_type': 'REVEAL_COLOR',
++              'color': str,
++              'target_offset': int >=0
++            }
++          - {
++              'action_type': 'REVEAL_RANK',
++              'rank': str,
++              'target_offset': int >=0
++            }
++
++    Returns:
++      move: A `HanabiMove` object constructed from action.
++
++    Raises:
++      ValueError: Unknown action type.
++    """
++    move = self.build_move_static(action)
+     legal_moves = self.state.legal_moves()
+     assert (str(move) in map(
+         str,
+@@ -498,7 +512,7 @@ class HanabiEnv(Environment):
+     return move
+ 
+ 
+-def make(environment_name="Hanabi-Full", num_players=2, pyhanabi_path=None):
++def make(environment_name="Hanabi-Full", num_players=2, seed=12345, pyhanabi_path=None):
+   """Make an environment.
+ 
+   Args:
+@@ -533,7 +547,9 @@ def make(environment_name="Hanabi-Full", num_players=2, pyhanabi_path=None):
+             "max_life_tokens":
+                 3,
+             "observation_type":
+-                pyhanabi.AgentObservationType.CARD_KNOWLEDGE.value
++                pyhanabi.AgentObservationType.CARD_KNOWLEDGE.value,
++            "seed":
++                seed
+         })
+   elif environment_name == "Hanabi-Full-Minimal":
+     return HanabiEnv(
+@@ -543,7 +559,8 @@ def make(environment_name="Hanabi-Full", num_players=2, pyhanabi_path=None):
+             "players": num_players,
+             "max_information_tokens": 8,
+             "max_life_tokens": 3,
+-            "observation_type": pyhanabi.AgentObservationType.MINIMAL.value
++            "observation_type": pyhanabi.AgentObservationType.MINIMAL.value,
++            "seed": seed
+         })
+   elif environment_name == "Hanabi-Small":
+     return HanabiEnv(
+@@ -561,7 +578,9 @@ def make(environment_name="Hanabi-Full", num_players=2, pyhanabi_path=None):
+             "max_life_tokens":
+                 1,
+             "observation_type":
+-                pyhanabi.AgentObservationType.CARD_KNOWLEDGE.value
++                pyhanabi.AgentObservationType.CARD_KNOWLEDGE.value,
++            "seed":
++                seed
+         })
+   elif environment_name == "Hanabi-Very-Small":
+     return HanabiEnv(
+@@ -579,7 +598,29 @@ def make(environment_name="Hanabi-Full", num_players=2, pyhanabi_path=None):
+             "max_life_tokens":
+                 1,
+             "observation_type":
+-                pyhanabi.AgentObservationType.CARD_KNOWLEDGE.value
++                pyhanabi.AgentObservationType.CARD_KNOWLEDGE.value,
++            "seed":
++                seed
++        })
++  elif environment_name == "Hanabi-My-Small":
++    return HanabiEnv(
++        config={
++            "colors":
++                4,
++            "ranks":
++                3, # 3*{1} + 2*{2} + 1*{3}
++            "players":
++                num_players,
++            "hand_size":
++                4,
++            "max_information_tokens":
++                8,
++            "max_life_tokens":
++                3,
++            "observation_type":
++                pyhanabi.AgentObservationType.CARD_KNOWLEDGE.value,
++            "seed":
++                seed
+         })
+   else:
+     raise ValueError("Unknown environment {}".format(environment_name))
+@@ -656,7 +697,7 @@ class Agent(object):
+     """
+     raise NotImplementedError("Not implemeneted in abstract base class.")
+ 
+-  def act(self, observation):
++  def act(self, observation, get_next_state):
+     """Act based on an observation.
+ 
+     Args:
+diff --git a/load.sh b/load.sh
+new file mode 100644
+index 0000000..4d47f65
+--- /dev/null
++++ b/load.sh
+@@ -0,0 +1,89 @@
++#!/bin/bash
++
++###############################################################################
++# This is a specific script which works with a specific python istallation at #
++# /usr/bin/python3.6                                                          #
++# Furthermore, virtualenv must be installed on the system                     #
++###############################################################################
++
++
++VIRTUALENV_PATH=~/.virtualenvs/hanabi
++
++create-virtualenv ()
++{
++    local FORCE=;
++    while [[ $# > 0 ]]; do
++        case "$1" in
++            --force)
++                FORCE=1
++            ;;
++            *)
++                echo "ERROR: unknown option: $1";
++                return 1
++            ;;
++        esac;
++        shift;
++    done;
++    mkdir -p ~/.virtualenvs;
++    if [[ -d $VIRTUALENV_PATH ]]; then
++        if [[ -n $FORCE ]]; then
++            rm -rf $VIRTUALENV_PATH;
++        else
++            echo 'ERROR: virtual environment already exists, use `--force` to recreate it';
++            return 1;
++        fi;
++    fi;
++    virtualenv -p /usr/bin/python3.6 $VIRTUALENV_PATH
++}
++
++activate-virtualenv ()
++{
++    if [[ -e $VIRTUALENV_PATH/bin/activate ]]; then
++        source $VIRTUALENV_PATH/bin/activate;
++        echo "Now using $(python -V) from $(which python)";
++    else
++        echo 'ERROR: no default virtualenv found`';
++    fi
++}
++
++check-active()
++{
++    local deact=$(typeset -F | cut -d " " -f 3 | grep "deactivate$")
++    if [[ "$deact" != "" ]]
++    then
++        echo "active"
++    fi
++}
++
++deactivate-virtualenv()
++{
++    local deact=$(typeset -F | cut -d " " -f 3 | grep "deactivate$")
++    if [[ "$deact" != "" ]]
++    then
++        echo "Deactivate virtualenv, goodbye :)"
++        deactivate > /dev/null 2>&1
++    fi
++}
++
++
++#############
++# Main part #
++#############
++option=$1
++
++# Must be sourced
++if [[ $_ != $0 ]]
++then
++    if [[ "$(check-active)" ]]
++    then
++        [[ "$option" != "" ]] && echo "Options are not available in active virtualenv."
++        deactivate-virtualenv
++    else
++        if [[ "$option" == "--recreate" || ! -d $VIRTUALENV_PATH ]]
++        then
++            echo "Creating virtual environment"
++            create-virtualenv --force
++        fi
++        activate-virtualenv
++    fi
++fi
+diff --git a/setup.py b/setup.py
+index 75cefd5..4bcaecc 100644
+--- a/setup.py
++++ b/setup.py
+@@ -6,5 +6,5 @@ setup(
+     description='Learning environment for the game of hanabi.',
+     author='deepmind/hanabi-learning-environment',
+     packages=['hanabi_learning_environment', 'hanabi_learning_environment.agents'],
+-    install_requires=['cffi']
++    install_requires=['cffi', 'matplotlib', 'psutil']
+ )

@@ -30,16 +30,16 @@ class SimpleAgent(Agent):
     """A card is playable if it can be placed on the fireworks pile."""
     return card['rank'] == fireworks[card['color']]
 
-  def act(self, observation):
+  def act(self, observation, get_next_state):
     """Act based on an observation."""
     if observation['current_player_offset'] != 0:
-      return None
+      return None, -1.0
 
     # Check if there are any pending hints and play the card corresponding to
     # the hint.
     for card_index, hint in enumerate(observation['card_knowledge'][0]):
       if hint['color'] is not None or hint['rank'] is not None:
-        return {'action_type': 'PLAY', 'card_index': card_index}
+        return {'action_type': 'PLAY', 'card_index': card_index}, 0
 
     # Check if it's possible to hint a card to your colleagues.
     fireworks = observation['fireworks']
@@ -56,10 +56,10 @@ class SimpleAgent(Agent):
                 'action_type': 'REVEAL_COLOR',
                 'color': card['color'],
                 'target_offset': player_offset
-            }
+            }, 0
 
     # If no card is hintable then discard or play.
     if observation['information_tokens'] < self.max_information_tokens:
-      return {'action_type': 'DISCARD', 'card_index': 0}
+      return {'action_type': 'DISCARD', 'card_index': 0}, 0
     else:
-      return {'action_type': 'PLAY', 'card_index': 0}
+      return {'action_type': 'PLAY', 'card_index': 0}, 0

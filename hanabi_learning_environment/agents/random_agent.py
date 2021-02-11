@@ -24,9 +24,9 @@ class RandomAgent(Agent):
     """Initialize the agent."""
     self.config = config
 
-  def act(self, observation):
+  def act(self, observation, get_next_state):
     """Act based on an observation."""
     if observation['current_player_offset'] == 0:
-      return random.choice(observation['legal_moves'])
+      return random.choice(observation['legal_moves']), 0
     else:
-      return None
+      return None, -1
